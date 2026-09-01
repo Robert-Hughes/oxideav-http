@@ -107,6 +107,8 @@
 //! makes `bytes=0-` unsatisfiable against a zero-length
 //! representation, so that 416 is range support working correctly).
 
+// internal — redirect-engine URI machinery; not part of the stable API
+#[doc(hidden)]
 pub mod uri;
 
 use std::io::{self, Read, Seek, SeekFrom};
