@@ -148,6 +148,67 @@ pub fn open_http(uri: &str) -> Result<Box<dyn BytesSource>> {
     Ok(Box::new(src))
 }
 
+/// Fetch a complete HTTP(S) resource with a normal GET, bounded by
+/// `max_bytes`. Unlike [`open_http`], this helper does **not** require the
+/// origin to support HEAD or byte ranges; it is intended for small metadata
+/// resources such as HLS/DASH manifests. Redirect and content-encoding policy
+/// is shared with the seekable HTTP driver.
+pub fn fetch_bytes(uri: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let knobs = DEFAULT_CONFIG.get().cloned().unwrap_or_default();
+    let walk = call_with_redirects(
+        agent(),
+        RequestMethod::Get,
+        uri,
+        &[("Accept-Encoding", "identity")],
+        &knobs,
+        false,
+        &format!("HTTP GET {uri}"),
+    )
+    .map_err(Error::Io)?;
+    let resp = walk.resp;
+    let status = resp.status();
+    if !status.is_success() {
+        let retry_msg = retry_after_hint_of(resp.headers());
+        return Err(Error::other(format!(
+            "HTTP GET {uri}: status {status}{retry_msg}"
+        )));
+    }
+
+    let codings = non_identity_codings_in(resp.headers());
+    if !codings.is_empty() {
+        return Err(Error::Unsupported(format!(
+            "HTTP GET {uri}: representation carries Content-Encoding {codings:?} despite \
+             'Accept-Encoding: identity'; fetch_bytes does not decode content codings"
+        )));
+    }
+
+    if let Some(content_len) = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if content_len > max_bytes {
+            return Err(Error::invalid(format!(
+                "HTTP GET {uri}: Content-Length {content_len} exceeds fetch_bytes limit {max_bytes}"
+            )));
+        }
+    }
+
+    let mut reader = resp
+        .into_body()
+        .into_reader()
+        .take(max_bytes.saturating_add(1));
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out)?;
+    if out.len() as u64 > max_bytes {
+        return Err(Error::invalid(format!(
+            "HTTP GET {uri}: response exceeds fetch_bytes limit {max_bytes}"
+        )));
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
