@@ -117,7 +117,7 @@ use std::time::Duration;
 
 use oxideav_core::BytesSource;
 use oxideav_core::RuntimeContext;
-use oxideav_core::{Error, Result};
+use oxideav_core::{CancellationToken, Error, Result};
 use oxideav_source::SourceRegistry;
 use ureq::Agent;
 
@@ -207,6 +207,112 @@ pub fn fetch_bytes(uri: &str, max_bytes: u64) -> Result<Vec<u8>> {
         )));
     }
     Ok(out)
+}
+
+/// Fetch a complete HTTP(S) resource like [`fetch_bytes`], but abort the
+/// in-flight transfer immediately when `cancellation` is cancelled.
+pub fn fetch_bytes_cancellable(
+    uri: &str,
+    max_bytes: u64,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>> {
+    if cancellation.is_cancelled() {
+        return Err(Error::cancelled(format!("HTTP GET {uri} cancelled")));
+    }
+
+    let knobs = DEFAULT_CONFIG.get().cloned().unwrap_or_default();
+    let redirect = if knobs.follow_redirects() {
+        reqwest::redirect::Policy::limited(knobs.max_redirects() as usize)
+    } else {
+        reqwest::redirect::Policy::none()
+    };
+    let mut builder = reqwest::Client::builder().redirect(redirect);
+    if knobs.https_only() {
+        builder = builder.https_only(true);
+    }
+    if let Some(timeout) = knobs.timeout_global() {
+        builder = builder.timeout(timeout);
+    }
+    if let Some(timeout) = knobs.timeout_connect() {
+        builder = builder.connect_timeout(timeout);
+    }
+    if let Some(user_agent) = knobs.user_agent() {
+        builder = builder.user_agent(user_agent.to_string());
+    }
+    let client = builder
+        .build()
+        .map_err(|error| Error::other(format!("HTTP GET {uri}: build client: {error}")))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::other(format!("HTTP GET {uri}: build runtime: {error}")))?;
+
+    runtime.block_on(async {
+        let request = client
+            .get(uri)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .send();
+        tokio::pin!(request);
+        let mut resp = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(Error::cancelled(format!("HTTP GET {uri} cancelled")));
+            }
+            result = &mut request => result
+                .map_err(|error| Error::other(format!("HTTP GET {uri}: {error}")))?,
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::other(format!("HTTP GET {uri}: status {status}")));
+        }
+        let codings = non_identity_codings_in_reqwest(resp.headers());
+        if !codings.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "HTTP GET {uri}: representation carries Content-Encoding {codings:?} despite \
+                 'Accept-Encoding: identity'; fetch_bytes_cancellable does not decode content codings"
+            )));
+        }
+        if let Some(content_len) = resp.content_length() {
+            if content_len > max_bytes {
+                return Err(Error::invalid(format!(
+                    "HTTP GET {uri}: Content-Length {content_len} exceeds fetch_bytes limit {max_bytes}"
+                )));
+            }
+        }
+
+        let mut out = Vec::new();
+        loop {
+            let chunk = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(Error::cancelled(format!("HTTP GET {uri} cancelled")));
+                }
+                result = resp.chunk() => result
+                    .map_err(|error| Error::other(format!("HTTP GET {uri}: {error}")))?,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if (out.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
+                return Err(Error::invalid(format!(
+                    "HTTP GET {uri}: response exceeds fetch_bytes limit {max_bytes}"
+                )));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    })
+}
+
+fn non_identity_codings_in_reqwest(headers: &reqwest::header::HeaderMap) -> Vec<String> {
+    headers
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("identity"))
+        .map(str::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -4379,6 +4485,83 @@ mod tests {
         let schemes: BTreeSet<&str> = reg.schemes().collect();
         assert!(schemes.contains("http"));
         assert!(schemes.contains("https"));
+    }
+
+    #[test]
+    fn cancellable_fetch_aborts_inflight_body_without_polling() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("test server address");
+        let (body_started_tx, body_started_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set server read timeout");
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).expect("read request");
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: keep-alive\r\n\r\nx",
+                )
+                .expect("write partial response");
+            stream.flush().expect("flush partial response");
+            body_started_tx.send(()).expect("signal body start");
+
+            let closed = match stream.read(&mut byte) {
+                Ok(0) => true,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            let _ = closed_tx.send(closed);
+        });
+
+        let token = CancellationToken::new();
+        let cancel_token = token.clone();
+        let canceller = std::thread::spawn(move || {
+            body_started_rx.recv().expect("wait for response body");
+            cancel_token.cancel();
+        });
+
+        let started = Instant::now();
+        let error = fetch_bytes_cancellable(
+            &format!("http://{addr}/manifest.m3u8"),
+            2 * 1024 * 1024,
+            &token,
+        )
+        .expect_err("cancelled fetch must fail");
+        assert!(error.is_cancelled(), "unexpected error: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation did not wake the fetch promptly"
+        );
+        assert!(
+            closed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("server should observe connection close"),
+            "cancelled transfer left its HTTP connection open"
+        );
+
+        canceller.join().expect("join canceller");
+        server.join().expect("join test server");
     }
 
     #[test]

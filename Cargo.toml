@@ -33,3 +33,5 @@ oxideav-source = "0.1"
 # before those checks run and redefine every byte count. `rustls` is
 # kept so https keeps working unchanged.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["rt", "macros"] }
