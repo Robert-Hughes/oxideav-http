@@ -47,6 +47,7 @@ let cfg = HttpConfig::builder()
     .read_retries(2)            // §14.2 transparent resume budget per read
     .seek_drain_max(64 * 1024)  // forward hops this short drain the live body
     .range_probe(false)         // opt-in GET probe for HEAD-hostile servers
+    .full_body_max_bytes(32 * 1024 * 1024) // cap fallback for a full 200 response
     .build();
 
 // (A) install once at startup so every registry-dispatched open()
@@ -233,7 +234,11 @@ regardless"). With `range_probe(true)` the driver falls back to a
   probe's own headers, and the probe body becomes the initial read
   stream, so a successful probe costs **no extra request**.
 - A **200** means the server exercised §14.2's "A server MAY ignore
-  the Range header field" — refused as unseekable.
+  the Range header field". The driver buffers the complete response,
+  including chunked responses without `Content-Length`, and serves
+  reads and seeks from memory. Buffering is capped by
+  `full_body_max_bytes` (default 32 MiB; `0` disables this fallback).
+  Larger responses are refused.
 - A **416** carrying `bytes */0` yields an empty source: §14.1.2
   makes `bytes=0-` unsatisfiable against a zero-length
   representation, so that 416 is range support working *correctly*.

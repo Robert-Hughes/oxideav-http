@@ -103,7 +103,8 @@
 //! support, its Content-Range supplies the complete-length (§14.4),
 //! and its body becomes the initial read stream — a successful probe
 //! costs no extra request. A 200 (server ignored `Range`, §14.2 MAY)
-//! is refused; a 416 with `bytes */0` yields an empty source (§14.1.2
+//! is buffered up to [`HttpConfig::full_body_max_bytes`] so local seeks
+//! remain possible; a 416 with `bytes */0` yields an empty source (§14.1.2
 //! makes `bytes=0-` unsatisfiable against a zero-length
 //! representation, so that 416 is range support working correctly).
 
@@ -385,6 +386,7 @@ pub struct HttpConfig {
     read_retries: u32,
     seek_drain_max: u64,
     range_probe: bool,
+    full_body_max_bytes: u64,
 }
 
 impl Default for HttpConfig {
@@ -406,6 +408,7 @@ impl Default for HttpConfig {
             read_retries: 2,
             seek_drain_max: 64 * 1024,
             range_probe: false,
+            full_body_max_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -517,10 +520,17 @@ impl HttpConfig {
     /// Accept-Ranges field"). The probe's 206 must self-describe the
     /// resource (Content-Range complete-length) and its body is used
     /// as the initial read stream, so a successful probe costs no
-    /// extra request. Default `false` — such servers are refused at
-    /// open, as before.
+    /// extra request. A 200 full response can be buffered for local
+    /// seeks, subject to [`HttpConfig::full_body_max_bytes`]. Default
+    /// `false` — such servers are refused at open, as before.
     pub fn range_probe(&self) -> bool {
         self.range_probe
+    }
+
+    /// Maximum full response buffered when an opening range probe gets `200`.
+    /// `0` disables that fallback. Default 32 MiB.
+    pub fn full_body_max_bytes(&self) -> u64 {
+        self.full_body_max_bytes
     }
 }
 
@@ -622,6 +632,13 @@ impl HttpConfigBuilder {
     /// [`HttpConfig::range_probe`]. Default `false`.
     pub fn range_probe(mut self, v: bool) -> Self {
         self.inner.range_probe = v;
+        self
+    }
+
+    /// Bound in-memory buffering of a full `200` response to an opening
+    /// range probe. Default 32 MiB; `0` rejects such responses.
+    pub fn full_body_max_bytes(mut self, n: u64) -> Self {
+        self.inner.full_body_max_bytes = n;
         self
     }
 
@@ -1101,6 +1118,9 @@ pub struct HttpSource {
     validator: Option<StrongValidator>,
     /// Active response body for the current contiguous read run, if any.
     body: Option<Box<dyn Read + Send>>,
+    /// Complete representation when a range-ignoring origin answered the
+    /// opening probe with `200`. Seeks are local in this mode.
+    buffered: Option<Vec<u8>>,
     /// Bytes the active `body` still promises to deliver. For a 206
     /// this is derived from the Content-Range span (RFC 9110 §15.3.7:
     /// "A client MUST inspect a 206 response's Content-Type and
@@ -1322,6 +1342,7 @@ impl HttpSource {
             agent: scoped,
             validator,
             body: None,
+            buffered: None,
             body_remaining: 0,
             knobs,
         })
@@ -1340,8 +1361,9 @@ impl HttpSource {
     /// succeeded but omitted Accept-Ranges, cross-checks it). The
     /// probe body becomes the initial read stream, so a successful
     /// probe costs no extra request. A 200 answer means the server
-    /// exercised §14.2's "A server MAY ignore the Range header field"
-    /// — useless for a seekable source, refused. A 416 with
+    /// exercised §14.2's "A server MAY ignore the Range header field";
+    /// buffer that complete response up to `full_body_max_bytes` and
+    /// satisfy seeks locally. A 416 with
     /// `bytes */0` is the CORRECT answer for an empty resource
     /// (§14.1.2: "When a selected representation has zero length, the
     /// only satisfiable form of range-spec in a GET request is a
@@ -1398,6 +1420,7 @@ impl HttpSource {
                     agent: scoped,
                     validator: None,
                     body: None,
+                    buffered: None,
                     body_remaining: 0,
                     knobs: knobs.clone(),
                 }),
@@ -1412,11 +1435,64 @@ impl HttpSource {
             };
         }
         if status == 200 {
-            return Err(Error::Unsupported(format!(
-                "HTTP GET probe {uri} ({why}): server ignored 'Range: bytes=0-' and answered \
-                 200 (RFC 9110 §14.2: 'A server MAY ignore the Range header field') — a \
-                 seekable byte source requires 206 range satisfaction"
-            )));
+            let limit = knobs.full_body_max_bytes();
+            if limit == 0 {
+                return Err(Error::Unsupported(format!(
+                    "HTTP GET probe {uri} ({why}): server ignored Range and answered 200; \
+                     full-body buffering is disabled"
+                )));
+            }
+            let headers = resp.headers();
+            let codings = non_identity_codings_in(headers);
+            if !codings.is_empty() {
+                return Err(Error::Unsupported(format!(
+                    "HTTP GET probe {uri} ({why}): 200 response carries Content-Encoding \
+                     {codings:?} despite 'Accept-Encoding: identity'"
+                )));
+            }
+            let declared_len = headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            if declared_len.is_some_and(|len| len > limit)
+                || head_total.is_some_and(|len| len > limit)
+            {
+                return Err(Error::Unsupported(format!(
+                    "HTTP GET probe {uri} ({why}): full response exceeds \
+                     full_body_max_bytes limit {limit}"
+                )));
+            }
+            let mut bytes = Vec::new();
+            resp.into_body()
+                .into_reader()
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            let total_len = bytes.len() as u64;
+            if total_len > limit {
+                return Err(Error::Unsupported(format!(
+                    "HTTP GET probe {uri} ({why}): full response exceeds \
+                     full_body_max_bytes limit {limit}"
+                )));
+            }
+            if declared_len.is_some_and(|len| len != total_len)
+                || head_total.is_some_and(|len| len != total_len)
+            {
+                return Err(Error::other(format!(
+                    "HTTP GET probe {uri} ({why}): full response length {total_len} \
+                     disagrees with Content-Length {declared_len:?} or HEAD length {head_total:?}"
+                )));
+            }
+            return Ok(Self {
+                uri: request_uri,
+                total_len,
+                pos: 0,
+                agent: scoped,
+                validator: None,
+                body: None,
+                buffered: Some(bytes),
+                body_remaining: 0,
+                knobs: knobs.clone(),
+            });
         }
         if status != 206 {
             let retry_msg = retry_after_hint_of(resp.headers());
@@ -1521,6 +1597,7 @@ impl HttpSource {
             agent: scoped,
             validator,
             body: Some(reader),
+            buffered: None,
             body_remaining: span,
             knobs: knobs.clone(),
         })
@@ -3445,6 +3522,13 @@ impl Read for HttpSource {
         if self.pos >= self.total_len {
             return Ok(0);
         }
+        if let Some(bytes) = self.buffered.as_ref() {
+            let start = usize::try_from(self.pos).expect("buffer position fits usize");
+            let count = out.len().min(bytes.len() - start);
+            out[..count].copy_from_slice(&bytes[start..start + count]);
+            self.pos += count as u64;
+            return Ok(count);
+        }
         // Transparent-resume budget for THIS call (RFC 9110 §14.2:
         // byte ranges "support efficient recovery from partially
         // failed transfers" — the recovery is a fresh `Range:
@@ -3555,6 +3639,10 @@ impl Seek for HttpSource {
         };
         if new_pos > self.total_len {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek past end"));
+        }
+        if self.buffered.is_some() {
+            self.pos = new_pos;
+            return Ok(new_pos);
         }
         if new_pos != self.pos {
             // A short forward hop inside the live body's declared span
@@ -4580,6 +4668,7 @@ mod tests {
         assert_eq!(c.read_retries(), 2);
         assert_eq!(c.seek_drain_max(), 64 * 1024);
         assert!(!c.range_probe());
+        assert_eq!(c.full_body_max_bytes(), 32 * 1024 * 1024);
     }
 
     #[test]
@@ -4598,6 +4687,7 @@ mod tests {
             .read_retries(7)
             .seek_drain_max(123)
             .range_probe(true)
+            .full_body_max_bytes(456)
             .build();
         assert!(!c.follow_redirects());
         assert_eq!(c.max_redirects(), 3);
@@ -4612,6 +4702,7 @@ mod tests {
         assert_eq!(c.read_retries(), 7);
         assert_eq!(c.seek_drain_max(), 123);
         assert!(c.range_probe());
+        assert_eq!(c.full_body_max_bytes(), 456);
     }
 
     #[test]
@@ -5819,20 +5910,128 @@ mod tests {
     }
 
     #[test]
-    fn probe_200_answer_is_unsupported() {
-        // §14.2: "A server MAY ignore the Range header field." A 200
-        // to the probe means it did — the resource is readable but not
-        // seekable, so the driver refuses it.
+    fn probe_200_answer_is_buffered_and_seekable() {
+        // §14.2: the server may ignore Range. A complete response can
+        // still be seeked locally without further HTTP requests.
         static GET_200: &[u8] = b"HTTP/1.1 200 OK\r\n\
             Content-Length: 10\r\n\
             Connection: close\r\n\
             \r\n\
             0123456789";
-        let (uri, _reqs) = spawn_script_server(vec![HEAD_405.to_vec(), GET_200.to_vec()]);
+        let (uri, reqs) = spawn_script_server(vec![HEAD_405.to_vec(), GET_200.to_vec()]);
+        let mut src = HttpSource::open_with_config(&uri, &probe_cfg()).expect("open");
+        assert_eq!(src.len(), 10);
+        let mut buf = [0; 4];
+        src.read_exact(&mut buf).expect("read start");
+        assert_eq!(&buf, b"0123");
+        assert_eq!(src.seek(SeekFrom::End(-3)).expect("seek near end"), 7);
+        src.read_exact(&mut buf[..3]).expect("read end");
+        assert_eq!(&buf[..3], b"789");
+        assert_eq!(src.seek(SeekFrom::Start(1)).expect("seek backward"), 1);
+        src.read_exact(&mut buf).expect("read again");
+        assert_eq!(&buf, b"1234");
+        assert!(src.seek(SeekFrom::End(1)).is_err());
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(
+            log.len(),
+            2,
+            "buffered seeks must not touch the wire: {log:#?}"
+        );
+    }
+
+    #[test]
+    fn probe_200_chunked_without_content_length_is_buffered() {
+        // YouTube-shaped segment: neither HEAD nor the full GET gives
+        // a Content-Length; the GET uses chunked transfer framing.
+        static HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Connection: close\r\n\
+            \r\n";
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Connection: close\r\n\
+            \r\n\
+            5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n";
+        let (uri, reqs) = spawn_script_server(vec![HEAD.to_vec(), GET.to_vec()]);
+        let mut src = HttpSource::open_with_config(&uri, &probe_cfg()).expect("open");
+        assert_eq!(src.len(), 10);
+        assert_eq!(src.seek(SeekFrom::Start(5)).expect("seek"), 5);
+        let mut buf = [0; 5];
+        src.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf, b"world");
+        assert_eq!(src.seek(SeekFrom::Start(0)).expect("seek backward"), 0);
+        src.read_exact(&mut buf).expect("read again");
+        assert_eq!(&buf, b"hello");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 2, "only HEAD and opening GET expected: {log:#?}");
+        assert!(log[1].to_ascii_lowercase().contains("range: bytes=0-"));
+    }
+
+    #[test]
+    fn probe_200_full_body_limit_rejects_declared_and_chunked_oversize() {
+        static DECLARED: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\nConnection: close\r\n\r\n0123456789";
+        static CHUNKED: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+            A\r\n0123456789\r\n0\r\n\r\n";
+        let cfg = HttpConfig::builder()
+            .range_probe(true)
+            .full_body_max_bytes(5)
+            .build();
+        for response in [DECLARED, CHUNKED] {
+            let (uri, _reqs) = spawn_script_server(vec![HEAD_405.to_vec(), response.to_vec()]);
+            let err = HttpSource::open_with_config(&uri, &cfg)
+                .err()
+                .expect("oversize response must fail");
+            assert!(err.to_string().contains("limit 5"), "wrong error: {err}");
+        }
+    }
+
+    #[test]
+    fn probe_200_full_body_buffering_can_be_disabled() {
+        let cfg = HttpConfig::builder()
+            .range_probe(true)
+            .full_body_max_bytes(0)
+            .build();
+        let (uri, _reqs) = spawn_script_server(vec![
+            HEAD_405.to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx".to_vec(),
+        ]);
+        let err = HttpSource::open_with_config(&uri, &cfg)
+            .err()
+            .expect("disabled buffering must fail");
+        assert!(err.to_string().contains("disabled"), "wrong error: {err}");
+    }
+
+    #[test]
+    fn probe_200_rejects_disagreement_with_head_length() {
+        static HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 9\r\nConnection: close\r\n\r\n";
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+            A\r\n0123456789\r\n0\r\n\r\n";
+        let (uri, _reqs) = spawn_script_server(vec![HEAD.to_vec(), GET.to_vec()]);
         let err = HttpSource::open_with_config(&uri, &probe_cfg())
             .err()
-            .expect("expected open to fail");
-        assert!(err.to_string().contains("ignored"), "wrong error: {err}");
+            .expect("disagreeing length must fail");
+        assert!(
+            err.to_string().contains("HEAD length Some(9)"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn probe_200_rejects_non_identity_content_encoding() {
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Encoding: gzip\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx";
+        let (uri, _reqs) = spawn_script_server(vec![HEAD_405.to_vec(), GET.to_vec()]);
+        let err = HttpSource::open_with_config(&uri, &probe_cfg())
+            .err()
+            .expect("coded response must fail");
+        assert!(
+            err.to_string().contains("Content-Encoding"),
+            "wrong error: {err}"
+        );
     }
 
     #[test]

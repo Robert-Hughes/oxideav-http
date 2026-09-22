@@ -35,3 +35,7 @@ oxideav-source = "0.1"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["rt", "macros"] }
+
+# The fork uses CancellationToken from the project-maintained core branch.
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/Robert-Hughes/oxideav-core.git", branch = "dev" }
