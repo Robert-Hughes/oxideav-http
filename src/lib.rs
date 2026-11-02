@@ -210,16 +210,49 @@ pub fn fetch_bytes(uri: &str, max_bytes: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Fetch a complete HTTP(S) resource like [`fetch_bytes`], but abort the
-/// in-flight transfer immediately when `cancellation` is cancelled.
+/// Fetch a complete HTTP resource using the cancellation-aware streaming
+/// implementation. Unlike the streaming callback, this retains all bytes.
 pub fn fetch_bytes_cancellable(
     uri: &str,
     max_bytes: u64,
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    fetch_stream_cancellable(uri, max_bytes, None, cancellation, |chunk| {
+        output.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    Ok(output)
+}
+
+/// Stream HTTP chunks via a callback, aborting promptly even when receiving
+/// headers or body data is stalled. The optional range specifies offset and
+/// length, requiring an exact HTTP 206 response and Content-Range match.
+/// Partial downloads on error must be discarded by the caller.
+pub fn fetch_stream_cancellable(
+    uri: &str,
+    max_bytes: u64,
+    range: Option<(u64, u64)>,
+    cancellation: &CancellationToken,
+    mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
     if cancellation.is_cancelled() {
         return Err(Error::cancelled(format!("HTTP GET {uri} cancelled")));
     }
+    let bounds = range
+        .map(|(offset, length)| {
+            let end = length
+                .checked_sub(1)
+                .and_then(|last| offset.checked_add(last))
+                .ok_or_else(|| {
+                    Error::invalid("HTTP byte range must have a positive nonoverflowing length")
+                })?;
+            if length > max_bytes {
+                return Err(Error::invalid("HTTP byte range exceeds the transfer limit"));
+            }
+            Ok((offset, end, length))
+        })
+        .transpose()?;
 
     let knobs = DEFAULT_CONFIG.get().cloned().unwrap_or_default();
     let redirect = if knobs.follow_redirects() {
@@ -237,8 +270,8 @@ pub fn fetch_bytes_cancellable(
     if let Some(timeout) = knobs.timeout_connect() {
         builder = builder.connect_timeout(timeout);
     }
-    if let Some(user_agent) = knobs.user_agent() {
-        builder = builder.user_agent(user_agent.to_string());
+    if let Some(agent) = knobs.user_agent() {
+        builder = builder.user_agent(agent.to_string());
     }
     let client = builder
         .build()
@@ -249,61 +282,97 @@ pub fn fetch_bytes_cancellable(
         .map_err(|error| Error::other(format!("HTTP GET {uri}: build runtime: {error}")))?;
 
     runtime.block_on(async {
-        let request = client
+        let mut request = client
             .get(uri)
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .send();
-        tokio::pin!(request);
-        let mut resp = tokio::select! {
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+        if let Some((offset, end, _)) = bounds {
+            request = request.header(reqwest::header::RANGE, format!("bytes={offset}-{end}"));
+        }
+        let send = request.send();
+        tokio::pin!(send);
+        let mut response = tokio::select! {
+            biased;
             _ = cancellation.cancelled() => {
                 return Err(Error::cancelled(format!("HTTP GET {uri} cancelled")));
             }
-            result = &mut request => result
+            response = &mut send => response
                 .map_err(|error| Error::other(format!("HTTP GET {uri}: {error}")))?,
         };
-
-        let status = resp.status();
-        if !status.is_success() {
+        let status = response.status();
+        if let Some((offset, end, _)) = bounds {
+            if status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(Error::other(format!(
+                    "HTTP GET {uri}: byte range requested but status {status}"
+                )));
+            }
+            let expected = format!("bytes {offset}-{end}/");
+            let actual = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| Error::invalid("HTTP byte range response missing Content-Range"))?;
+            if !actual.starts_with(&expected)
+                || actual[expected.len()..]
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|total| *total > end)
+                    .is_none()
+            {
+                return Err(Error::invalid(format!(
+                    "HTTP GET {uri}: unexpected Content-Range {actual:?}"
+                )));
+            }
+        } else if !status.is_success() {
             return Err(Error::other(format!("HTTP GET {uri}: status {status}")));
         }
-        let codings = non_identity_codings_in_reqwest(resp.headers());
+        let codings = non_identity_codings_in_reqwest(response.headers());
         if !codings.is_empty() {
             return Err(Error::Unsupported(format!(
-                "HTTP GET {uri}: representation carries Content-Encoding {codings:?} despite \
-                 'Accept-Encoding: identity'; fetch_bytes_cancellable does not decode content codings"
+                "HTTP GET {uri}: response has unsupported Content-Encoding {codings:?}"
             )));
         }
-        if let Some(content_len) = resp.content_length() {
-            if content_len > max_bytes {
+        let expected_len = bounds.map(|(_, _, length)| length);
+        if let Some(content_len) = response.content_length() {
+            if content_len > max_bytes
+                || expected_len.is_some_and(|required| content_len != required)
+            {
                 return Err(Error::invalid(format!(
-                    "HTTP GET {uri}: Content-Length {content_len} exceeds fetch_bytes limit {max_bytes}"
+                    "HTTP GET {uri}: unexpected Content-Length {content_len}"
                 )));
             }
         }
-
-        let mut out = Vec::new();
+        let mut total = 0u64;
         loop {
-            let chunk = tokio::select! {
+            let next = tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => {
                     return Err(Error::cancelled(format!("HTTP GET {uri} cancelled")));
                 }
-                result = resp.chunk() => result
+                result = response.chunk() => result
                     .map_err(|error| Error::other(format!("HTTP GET {uri}: {error}")))?,
             };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            if (out.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
+            let Some(chunk) = next else { break };
+            total = total
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| Error::invalid("HTTP response length overflow"))?;
+            if total > max_bytes || expected_len.is_some_and(|length| total > length) {
                 return Err(Error::invalid(format!(
-                    "HTTP GET {uri}: response exceeds fetch_bytes limit {max_bytes}"
+                    "HTTP GET {uri}: response exceeds expected size"
                 )));
             }
-            out.extend_from_slice(&chunk);
+            if cancellation.is_cancelled() {
+                return Err(Error::cancelled(format!("HTTP GET {uri} cancelled")));
+            }
+            on_chunk(&chunk)?;
         }
-        Ok(out)
+        if expected_len.is_some_and(|length| length != total) {
+            return Err(Error::invalid(format!(
+                "HTTP GET {uri}: truncated range response ({total} bytes)"
+            )));
+        }
+        Ok(())
     })
 }
-
 fn non_identity_codings_in_reqwest(headers: &reqwest::header::HeaderMap) -> Vec<String> {
     headers
         .get_all(reqwest::header::CONTENT_ENCODING)
@@ -4650,6 +4719,116 @@ mod tests {
 
         canceller.join().expect("join canceller");
         server.join().expect("join test server");
+    }
+
+    #[test]
+    fn streamed_http_chunks_arrive_before_eof_and_cancel_while_stalled() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first_chunk, started_rx) = mpsc::channel();
+        let (chunk_tx, chunk_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut head = Vec::new();
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut b).unwrap();
+                head.push(b[0]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: keep-alive\r\n\r\nhello").unwrap();
+            socket.flush().unwrap();
+            first_chunk.send(()).unwrap();
+            // Keep the connection open without delivering the remaining body.
+            let closed = matches!(socket.read(&mut b), Ok(0) | Err(_));
+            closed
+        });
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let canceller = std::thread::spawn(move || {
+            started_rx.recv().unwrap();
+            chunk_rx.recv().unwrap();
+            cancel.cancel();
+        });
+        let start = Instant::now();
+        let mut chunks = Vec::new();
+        let err = fetch_stream_cancellable(
+            &format!("http://{addr}/segment.ts"),
+            8192,
+            None,
+            &token,
+            |bytes| {
+                chunks.extend_from_slice(bytes);
+                let _ = chunk_tx.send(());
+                Ok(())
+            },
+        )
+        .expect_err("stall should be cancelled");
+        assert!(err.is_cancelled(), "{err}");
+        assert_eq!(chunks, b"hello");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "cancellation stalled"
+        );
+        canceller.join().unwrap();
+        assert!(server.join().unwrap(), "HTTP connection remained open");
+    }
+
+    #[test]
+    fn streaming_byte_range_validates_response_and_exact_payload() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for good in [true, false] {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut req = Vec::new();
+                let mut b = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut b).unwrap();
+                    req.push(b[0]);
+                }
+                assert!(String::from_utf8_lossy(&req).contains("bytes=4-7"));
+                if good {
+                    socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 4-7/10\r\nConnection: close\r\n\r\n4567").unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789").unwrap();
+                }
+            }
+        });
+        let token = CancellationToken::new();
+        let mut bytes = Vec::new();
+        fetch_stream_cancellable(
+            &format!("http://{addr}/resource"),
+            8,
+            Some((4, 4)),
+            &token,
+            |part| {
+                bytes.extend_from_slice(part);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, b"4567");
+        assert!(
+            fetch_stream_cancellable(
+                &format!("http://{addr}/resource"),
+                8,
+                Some((4, 4)),
+                &token,
+                |_| Ok(())
+            )
+            .is_err(),
+            "server ignoring Range must be rejected"
+        );
+        server.join().unwrap();
     }
 
     #[test]
