@@ -331,10 +331,16 @@ pub fn fetch_stream_cancellable(
                 "HTTP GET {uri}: response has unsupported Content-Encoding {codings:?}"
             )));
         }
-        let expected_len = bounds.map(|(_, _, length)| length);
-        if let Some(content_len) = response.content_length() {
+        // Range responses have an exact requested size; ordinary segment GETs
+        // may also advertise Content-Length. Check both instead of relying on
+        // reqwest to classify a prematurely closed connection. Include transfer
+        // progress in failures so intermittent HLS EOFs can be distinguished
+        // from a failed request before any segment bytes arrived.
+        let declared_len = response.content_length();
+        let expected_len = bounds.map(|(_, _, length)| length).or(declared_len);
+        if let Some(content_len) = declared_len {
             if content_len > max_bytes
-                || expected_len.is_some_and(|required| content_len != required)
+                || bounds.is_some_and(|(_, _, required)| content_len != required)
             {
                 return Err(Error::invalid(format!(
                     "HTTP GET {uri}: unexpected Content-Length {content_len}"
@@ -346,10 +352,13 @@ pub fn fetch_stream_cancellable(
             let next = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
-                    return Err(Error::cancelled(format!("HTTP GET {uri} cancelled")));
+                    return Err(Error::cancelled(format!("HTTP GET {uri} cancelled after {total} bytes")));
                 }
-                result = response.chunk() => result
-                    .map_err(|error| Error::other(format!("HTTP GET {uri}: {error}")))?,
+                result = response.chunk() => result.map_err(|error| {
+                    Error::other(format!(
+                        "HTTP GET {uri}: body read failed status={status} range={bounds:?} received={total} expected={expected_len:?}: {error}"
+                    ))
+                })?,
             };
             let Some(chunk) = next else { break };
             total = total
@@ -357,17 +366,17 @@ pub fn fetch_stream_cancellable(
                 .ok_or_else(|| Error::invalid("HTTP response length overflow"))?;
             if total > max_bytes || expected_len.is_some_and(|length| total > length) {
                 return Err(Error::invalid(format!(
-                    "HTTP GET {uri}: response exceeds expected size"
+                    "HTTP GET {uri}: response exceeds expected size (received={total}, expected={expected_len:?})"
                 )));
             }
             if cancellation.is_cancelled() {
-                return Err(Error::cancelled(format!("HTTP GET {uri} cancelled")));
+                return Err(Error::cancelled(format!("HTTP GET {uri} cancelled after {total} bytes")));
             }
             on_chunk(&chunk)?;
         }
         if expected_len.is_some_and(|length| length != total) {
             return Err(Error::invalid(format!(
-                "HTTP GET {uri}: truncated range response ({total} bytes)"
+                "HTTP GET {uri}: truncated response status={status} range={bounds:?} received={total} expected={expected_len:?}"
             )));
         }
         Ok(())
@@ -4778,6 +4787,45 @@ mod tests {
         );
         canceller.join().unwrap();
         assert!(server.join().unwrap(), "HTTP connection remained open");
+    }
+
+    #[test]
+    fn truncated_unranged_segment_reports_partial_transfer_progress() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nhello",
+                )
+                .unwrap();
+        });
+        let mut received = Vec::new();
+        let error = fetch_stream_cancellable(
+            &format!("http://{addr}/segment.ts"),
+            1024,
+            None,
+            &CancellationToken::new(),
+            |chunk| {
+                received.extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .expect_err("truncated segment must fail");
+        let detail = error.to_string();
+        assert!(detail.contains("received=5"), "{detail}");
+        assert!(detail.contains("expected=Some(20)"), "{detail}");
+        assert_eq!(received, b"hello");
+        server.join().unwrap();
     }
 
     #[test]
